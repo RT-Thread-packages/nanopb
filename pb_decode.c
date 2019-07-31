@@ -21,75 +21,72 @@
  * Declarations internal to this file *
  **************************************/
 
-typedef bool (*pb_decoder_t)(pb_istream_t *stream, const pb_field_t *field, void *dest) checkreturn;
-
-static bool checkreturn buf_read(pb_istream_t *stream, uint8_t *buf, size_t count);
-static bool checkreturn pb_decode_varint32(pb_istream_t *stream, uint32_t *dest);
-static bool checkreturn read_raw_value(pb_istream_t *stream, pb_wire_type_t wire_type, uint8_t *buf, size_t *size);
-static bool checkreturn decode_static_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter);
-static bool checkreturn decode_callback_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter);
-static bool checkreturn decode_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter);
+static bool checkreturn buf_read(pb_istream_t *stream, pb_byte_t *buf, size_t count);
+static bool checkreturn pb_decode_varint32_eof(pb_istream_t *stream, uint32_t *dest, bool *eof);
+static bool checkreturn read_raw_value(pb_istream_t *stream, pb_wire_type_t wire_type, pb_byte_t *buf, size_t *size);
+static bool checkreturn decode_basic_field(pb_istream_t *stream, pb_field_iter_t *field);
+static bool checkreturn decode_static_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field);
+static bool checkreturn decode_pointer_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field);
+static bool checkreturn decode_callback_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field);
+static bool checkreturn decode_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field);
 static bool checkreturn default_extension_decoder(pb_istream_t *stream, pb_extension_t *extension, uint32_t tag, pb_wire_type_t wire_type);
 static bool checkreturn decode_extension(pb_istream_t *stream, uint32_t tag, pb_wire_type_t wire_type, pb_field_iter_t *iter);
 static bool checkreturn find_extension_field(pb_field_iter_t *iter);
-static void pb_message_set_to_defaults(const pb_field_t fields[], void *dest_struct);
-static bool checkreturn pb_dec_varint(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_uvarint(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_svarint(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_fixed32(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_fixed64(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_string(pb_istream_t *stream, const pb_field_t *field, void *dest);
-static bool checkreturn pb_dec_submessage(pb_istream_t *stream, const pb_field_t *field, void *dest);
+static bool pb_message_set_to_defaults(pb_field_iter_t *iter);
+static bool checkreturn pb_dec_varint(pb_istream_t *stream, const pb_field_iter_t *field);
+static bool checkreturn pb_dec_fixed(pb_istream_t *stream, const pb_field_iter_t *field);
+static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_iter_t *field);
+static bool checkreturn pb_dec_string(pb_istream_t *stream, const pb_field_iter_t *field);
+static bool checkreturn pb_dec_submessage(pb_istream_t *stream, const pb_field_iter_t *field);
+static bool checkreturn pb_dec_fixed_length_bytes(pb_istream_t *stream, const pb_field_iter_t *field);
 static bool checkreturn pb_skip_varint(pb_istream_t *stream);
 static bool checkreturn pb_skip_string(pb_istream_t *stream);
 
 #ifdef PB_ENABLE_MALLOC
 static bool checkreturn allocate_field(pb_istream_t *stream, void *pData, size_t data_size, size_t array_size);
-static void pb_release_single_field(const pb_field_iter_t *iter);
+static void initialize_pointer_field(void *pItem, pb_field_iter_t *field);
+static bool checkreturn pb_release_union_field(pb_istream_t *stream, pb_field_iter_t *field);
+static void pb_release_single_field(pb_field_iter_t *field);
 #endif
 
-/* --- Function pointers to field decoders ---
- * Order in the array must match pb_action_t LTYPE numbering.
- */
-static const pb_decoder_t PB_DECODERS[PB_LTYPES_COUNT] = {
-    &pb_dec_varint,
-    &pb_dec_uvarint,
-    &pb_dec_svarint,
-    &pb_dec_fixed32,
-    &pb_dec_fixed64,
-    
-    &pb_dec_bytes,
-    &pb_dec_string,
-    &pb_dec_submessage,
-    NULL /* extensions */
-};
+#ifdef PB_WITHOUT_64BIT
+#define pb_int64_t int32_t
+#define pb_uint64_t uint32_t
+#else
+#define pb_int64_t int64_t
+#define pb_uint64_t uint64_t
+#endif
+
+typedef struct {
+    uint32_t bitfield[(PB_MAX_REQUIRED_FIELDS + 31) / 32];
+} pb_fields_seen_t;
 
 /*******************************
  * pb_istream_t implementation *
  *******************************/
 
-static bool checkreturn buf_read(pb_istream_t *stream, uint8_t *buf, size_t count)
+static bool checkreturn buf_read(pb_istream_t *stream, pb_byte_t *buf, size_t count)
 {
-    uint8_t *source = (uint8_t*)stream->state;
-    stream->state = source + count;
+    size_t i;
+    const pb_byte_t *source = (const pb_byte_t*)stream->state;
+    stream->state = (pb_byte_t*)stream->state + count;
     
     if (buf != NULL)
     {
-        while (count--)
-            *buf++ = *source++;
+        for (i = 0; i < count; i++)
+            buf[i] = source[i];
     }
     
     return true;
 }
 
-bool checkreturn pb_read(pb_istream_t *stream, uint8_t *buf, size_t count)
+bool checkreturn pb_read(pb_istream_t *stream, pb_byte_t *buf, size_t count)
 {
 #ifndef PB_BUFFER_ONLY
 	if (buf == NULL && stream->callback != buf_read)
 	{
 		/* Skip input bytes */
-		uint8_t tmp[16];
+		pb_byte_t tmp[16];
 		while (count > 16)
 		{
 			if (!pb_read(stream, tmp, 16))
@@ -119,7 +116,7 @@ bool checkreturn pb_read(pb_istream_t *stream, uint8_t *buf, size_t count)
 
 /* Read a single byte from input stream. buf may not be NULL.
  * This is an optimization for the varint decoding. */
-static bool checkreturn pb_readbyte(pb_istream_t *stream, uint8_t *buf)
+static bool checkreturn pb_readbyte(pb_istream_t *stream, pb_byte_t *buf)
 {
     if (stream->bytes_left == 0)
         PB_RETURN_ERROR(stream, "end-of-stream");
@@ -128,8 +125,8 @@ static bool checkreturn pb_readbyte(pb_istream_t *stream, uint8_t *buf)
     if (!stream->callback(stream, buf, 1))
         PB_RETURN_ERROR(stream, "io error");
 #else
-    *buf = *(uint8_t*)stream->state;
-    stream->state = (uint8_t*)stream->state + 1;
+    *buf = *(const pb_byte_t*)stream->state;
+    stream->state = (pb_byte_t*)stream->state + 1;
 #endif
 
     stream->bytes_left--;
@@ -137,15 +134,23 @@ static bool checkreturn pb_readbyte(pb_istream_t *stream, uint8_t *buf)
     return true;    
 }
 
-pb_istream_t pb_istream_from_buffer(uint8_t *buf, size_t bufsize)
+pb_istream_t pb_istream_from_buffer(const pb_byte_t *buf, size_t bufsize)
 {
     pb_istream_t stream;
+    /* Cast away the const from buf without a compiler error.  We are
+     * careful to use it only in a const manner in the callbacks.
+     */
+    union {
+        void *state;
+        const void *c_state;
+    } state;
 #ifdef PB_BUFFER_ONLY
     stream.callback = NULL;
 #else
     stream.callback = &buf_read;
 #endif
-    stream.state = buf;
+    state.c_state = buf;
+    stream.state = state.state;
     stream.bytes_left = bufsize;
 #ifndef PB_NO_ERRMSG
     stream.errmsg = NULL;
@@ -157,13 +162,23 @@ pb_istream_t pb_istream_from_buffer(uint8_t *buf, size_t bufsize)
  * Helper functions *
  ********************/
 
-static bool checkreturn pb_decode_varint32(pb_istream_t *stream, uint32_t *dest)
+static bool checkreturn pb_decode_varint32_eof(pb_istream_t *stream, uint32_t *dest, bool *eof)
 {
-    uint8_t byte;
+    pb_byte_t byte;
     uint32_t result;
     
     if (!pb_readbyte(stream, &byte))
+    {
+        if (stream->bytes_left == 0)
+        {
+            if (eof)
+            {
+                *eof = true;
+            }
+        }
+
         return false;
+    }
     
     if ((byte & 0x80) == 0)
     {
@@ -173,30 +188,52 @@ static bool checkreturn pb_decode_varint32(pb_istream_t *stream, uint32_t *dest)
     else
     {
         /* Multibyte case */
-        uint8_t bitpos = 7;
+        uint_fast8_t bitpos = 7;
         result = byte & 0x7F;
         
         do
         {
-            if (bitpos >= 32)
-                PB_RETURN_ERROR(stream, "varint overflow");
-            
             if (!pb_readbyte(stream, &byte))
                 return false;
             
-            result |= (uint32_t)(byte & 0x7F) << bitpos;
-            bitpos = (uint8_t)(bitpos + 7);
+            if (bitpos >= 32)
+            {
+                /* Note: The varint could have trailing 0x80 bytes, or 0xFF for negative. */
+                uint8_t sign_extension = (bitpos < 63) ? 0xFF : 0x01;
+                
+                if ((byte & 0x7F) != 0x00 && ((result >> 31) == 0 || byte != sign_extension))
+                {
+                    PB_RETURN_ERROR(stream, "varint overflow");
+                }
+            }
+            else
+            {
+                result |= (uint32_t)(byte & 0x7F) << bitpos;
+            }
+            bitpos = (uint_fast8_t)(bitpos + 7);
         } while (byte & 0x80);
+        
+        if (bitpos == 35 && (byte & 0x70) != 0)
+        {
+            /* The last byte was at bitpos=28, so only bottom 4 bits fit. */
+            PB_RETURN_ERROR(stream, "varint overflow");
+        }
    }
    
    *dest = result;
    return true;
 }
 
+bool checkreturn pb_decode_varint32(pb_istream_t *stream, uint32_t *dest)
+{
+    return pb_decode_varint32_eof(stream, dest, NULL);
+}
+
+#ifndef PB_WITHOUT_64BIT
 bool checkreturn pb_decode_varint(pb_istream_t *stream, uint64_t *dest)
 {
-    uint8_t byte;
-    uint8_t bitpos = 0;
+    pb_byte_t byte;
+    uint_fast8_t bitpos = 0;
     uint64_t result = 0;
     
     do
@@ -208,16 +245,17 @@ bool checkreturn pb_decode_varint(pb_istream_t *stream, uint64_t *dest)
             return false;
 
         result |= (uint64_t)(byte & 0x7F) << bitpos;
-        bitpos = (uint8_t)(bitpos + 7);
+        bitpos = (uint_fast8_t)(bitpos + 7);
     } while (byte & 0x80);
     
     *dest = result;
     return true;
 }
+#endif
 
 bool checkreturn pb_skip_varint(pb_istream_t *stream)
 {
-    uint8_t byte;
+    pb_byte_t byte;
     do
     {
         if (!pb_read(stream, &byte, 1))
@@ -242,17 +280,8 @@ bool checkreturn pb_decode_tag(pb_istream_t *stream, pb_wire_type_t *wire_type, 
     *wire_type = (pb_wire_type_t) 0;
     *tag = 0;
     
-    if (!pb_decode_varint32(stream, &temp))
+    if (!pb_decode_varint32_eof(stream, &temp, eof))
     {
-        if (stream->bytes_left == 0)
-            *eof = true;
-
-        return false;
-    }
-    
-    if (temp == 0)
-    {
-        *eof = true; /* Special feature: allow 0-terminated messages. */
         return false;
     }
     
@@ -276,7 +305,7 @@ bool checkreturn pb_skip_field(pb_istream_t *stream, pb_wire_type_t wire_type)
 /* Read a raw value to buffer, for the purpose of passing it to callback as
  * a substream. Size is maximum size on call, and actual size on return.
  */
-static bool checkreturn read_raw_value(pb_istream_t *stream, pb_wire_type_t wire_type, uint8_t *buf, size_t *size)
+static bool checkreturn read_raw_value(pb_istream_t *stream, pb_wire_type_t wire_type, pb_byte_t *buf, size_t *size)
 {
     size_t max_size = *size;
     switch (wire_type)
@@ -286,8 +315,11 @@ static bool checkreturn read_raw_value(pb_istream_t *stream, pb_wire_type_t wire
             do
             {
                 (*size)++;
-                if (*size > max_size) return false;
-                if (!pb_read(stream, buf, 1)) return false;
+                if (*size > max_size)
+                    PB_RETURN_ERROR(stream, "varint overflow");
+
+                if (!pb_read(stream, buf, 1))
+                    return false;
             } while (*buf++ & 0x80);
             return true;
             
@@ -299,6 +331,12 @@ static bool checkreturn read_raw_value(pb_istream_t *stream, pb_wire_type_t wire
             *size = 4;
             return pb_read(stream, buf, 4);
         
+        case PB_WT_STRING:
+            /* Calling read_raw_value with a PB_WT_STRING is an error.
+             * Explicitly handle this case and fallthrough to default to avoid
+             * compiler warnings.
+             */
+
         default: PB_RETURN_ERROR(stream, "invalid wire_type");
     }
 }
@@ -321,75 +359,119 @@ bool checkreturn pb_make_string_substream(pb_istream_t *stream, pb_istream_t *su
     return true;
 }
 
-void pb_close_string_substream(pb_istream_t *stream, pb_istream_t *substream)
+bool checkreturn pb_close_string_substream(pb_istream_t *stream, pb_istream_t *substream)
 {
+    if (substream->bytes_left) {
+        if (!pb_read(substream, NULL, substream->bytes_left))
+            return false;
+    }
+
     stream->state = substream->state;
 
 #ifndef PB_NO_ERRMSG
     stream->errmsg = substream->errmsg;
 #endif
+    return true;
 }
 
 /*************************
  * Decode a single field *
  *************************/
 
-static bool checkreturn decode_static_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter)
+static bool checkreturn decode_basic_field(pb_istream_t *stream, pb_field_iter_t *field)
 {
-    pb_type_t type;
-    pb_decoder_t func;
-    
-    type = iter->pos->type;
-    func = PB_DECODERS[PB_LTYPE(type)];
+    switch (PB_LTYPE(field->type))
+    {
+        case PB_LTYPE_VARINT:
+        case PB_LTYPE_UVARINT:
+        case PB_LTYPE_SVARINT:
+            return pb_dec_varint(stream, field);
 
-    switch (PB_HTYPE(type))
+        case PB_LTYPE_FIXED32:
+        case PB_LTYPE_FIXED64:
+            return pb_dec_fixed(stream, field);
+
+        case PB_LTYPE_BYTES:
+            return pb_dec_bytes(stream, field);
+
+        case PB_LTYPE_STRING:
+            return pb_dec_string(stream, field);
+
+        case PB_LTYPE_SUBMESSAGE:
+            return pb_dec_submessage(stream, field);
+
+        case PB_LTYPE_FIXED_LENGTH_BYTES:
+            return pb_dec_fixed_length_bytes(stream, field);
+
+        default:
+            PB_RETURN_ERROR(stream, "invalid field type");
+    }
+}
+
+static bool checkreturn decode_static_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field)
+{
+    switch (PB_HTYPE(field->type))
     {
         case PB_HTYPE_REQUIRED:
-            return func(stream, iter->pos, iter->pData);
+            return decode_basic_field(stream, field);
             
         case PB_HTYPE_OPTIONAL:
-            *(bool*)iter->pSize = true;
-            return func(stream, iter->pos, iter->pData);
+            if (field->pSize != NULL)
+                *(bool*)field->pSize = true;
+            return decode_basic_field(stream, field);
     
         case PB_HTYPE_REPEATED:
             if (wire_type == PB_WT_STRING
-                && PB_LTYPE(type) <= PB_LTYPE_LAST_PACKABLE)
+                && PB_LTYPE(field->type) <= PB_LTYPE_LAST_PACKABLE)
             {
                 /* Packed array */
                 bool status = true;
-                pb_size_t *size = (pb_size_t*)iter->pSize;
                 pb_istream_t substream;
+                pb_size_t *size = (pb_size_t*)field->pSize;
+                field->pData = (char*)field->pField + field->data_size * (*size);
+
                 if (!pb_make_string_substream(stream, &substream))
                     return false;
-                
-                while (substream.bytes_left > 0 && *size < iter->pos->array_size)
+
+                while (substream.bytes_left > 0 && *size < field->array_size)
                 {
-                    void *pItem = (uint8_t*)iter->pData + iter->pos->data_size * (*size);
-                    if (!func(&substream, iter->pos, pItem))
+                    if (!decode_basic_field(&substream, field))
                     {
                         status = false;
                         break;
                     }
                     (*size)++;
+                    field->pData = (char*)field->pData + field->data_size;
                 }
-                pb_close_string_substream(stream, &substream);
-                
+
                 if (substream.bytes_left != 0)
                     PB_RETURN_ERROR(stream, "array overflow");
-                
+                if (!pb_close_string_substream(stream, &substream))
+                    return false;
+
                 return status;
             }
             else
             {
                 /* Repeated field */
-                pb_size_t *size = (pb_size_t*)iter->pSize;
-                void *pItem = (uint8_t*)iter->pData + iter->pos->data_size * (*size);
-                if (*size >= iter->pos->array_size)
+                pb_size_t *size = (pb_size_t*)field->pSize;
+                field->pData = (char*)field->pField + field->data_size * (*size);
+
+                if ((*size)++ >= field->array_size)
                     PB_RETURN_ERROR(stream, "array overflow");
-                
-                (*size)++;
-                return func(stream, iter->pos, pItem);
+
+                return decode_basic_field(stream, field);
             }
+
+        case PB_HTYPE_ONEOF:
+            *(pb_size_t*)field->pSize = field->tag;
+            if (PB_LTYPE(field->type) == PB_LTYPE_SUBMESSAGE)
+            {
+                /* We memset to zero so that any callbacks are set to NULL.
+                 * pb_dec_submessage() will set any default values. */
+                memset(field->pData, 0, field->data_size);
+            }
+            return decode_basic_field(stream, field);
 
         default:
             PB_RETURN_ERROR(stream, "invalid field type");
@@ -437,67 +519,78 @@ static bool checkreturn allocate_field(pb_istream_t *stream, void *pData, size_t
 }
 
 /* Clear a newly allocated item in case it contains a pointer, or is a submessage. */
-static void initialize_pointer_field(void *pItem, pb_field_iter_t *iter)
+static void initialize_pointer_field(void *pItem, pb_field_iter_t *field)
 {
-    if (PB_LTYPE(iter->pos->type) == PB_LTYPE_STRING ||
-        PB_LTYPE(iter->pos->type) == PB_LTYPE_BYTES)
+    if (PB_LTYPE(field->type) == PB_LTYPE_STRING ||
+        PB_LTYPE(field->type) == PB_LTYPE_BYTES)
     {
         *(void**)pItem = NULL;
     }
-    else if (PB_LTYPE(iter->pos->type) == PB_LTYPE_SUBMESSAGE)
+    else if (PB_LTYPE(field->type) == PB_LTYPE_SUBMESSAGE)
     {
-        pb_message_set_to_defaults((const pb_field_t *) iter->pos->ptr, pItem);
+        /* We memset to zero so that any callbacks are set to NULL.
+         * Then set any default values. */
+        pb_field_iter_t submsg_iter;
+        memset(pItem, 0, field->data_size);
+
+        if (pb_field_iter_begin(&submsg_iter, field->submsg_desc, pItem))
+        {
+            (void)pb_message_set_to_defaults(&submsg_iter);
+        }
     }
 }
 #endif
 
-static bool checkreturn decode_pointer_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter)
+static bool checkreturn decode_pointer_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field)
 {
 #ifndef PB_ENABLE_MALLOC
     PB_UNUSED(wire_type);
-    PB_UNUSED(iter);
+    PB_UNUSED(field);
     PB_RETURN_ERROR(stream, "no malloc support");
 #else
-    pb_type_t type;
-    pb_decoder_t func;
-    
-    type = iter->pos->type;
-    func = PB_DECODERS[PB_LTYPE(type)];
-    
-    switch (PB_HTYPE(type))
+    switch (PB_HTYPE(field->type))
     {
         case PB_HTYPE_REQUIRED:
         case PB_HTYPE_OPTIONAL:
-            if (PB_LTYPE(type) == PB_LTYPE_SUBMESSAGE &&
-                *(void**)iter->pData != NULL)
+        case PB_HTYPE_ONEOF:
+            if (PB_LTYPE(field->type) == PB_LTYPE_SUBMESSAGE &&
+                *(void**)field->pField != NULL)
             {
                 /* Duplicate field, have to release the old allocation first. */
-                pb_release_single_field(iter);
+                /* FIXME: Does this work correctly for oneofs? */
+                pb_release_single_field(field);
             }
         
-            if (PB_LTYPE(type) == PB_LTYPE_STRING ||
-                PB_LTYPE(type) == PB_LTYPE_BYTES)
+            if (PB_HTYPE(field->type) == PB_HTYPE_ONEOF)
             {
-                return func(stream, iter->pos, iter->pData);
+                *(pb_size_t*)field->pSize = field->tag;
+            }
+
+            if (PB_LTYPE(field->type) == PB_LTYPE_STRING ||
+                PB_LTYPE(field->type) == PB_LTYPE_BYTES)
+            {
+                /* pb_dec_string and pb_dec_bytes handle allocation themselves */
+                field->pData = field->pField;
+                return decode_basic_field(stream, field);
             }
             else
             {
-                if (!allocate_field(stream, iter->pData, iter->pos->data_size, 1))
+                if (!allocate_field(stream, field->pField, field->data_size, 1))
                     return false;
                 
-                initialize_pointer_field(*(void**)iter->pData, iter);
-                return func(stream, iter->pos, *(void**)iter->pData);
+                field->pData = *(void**)field->pField;
+                initialize_pointer_field(field->pData, field);
+                return decode_basic_field(stream, field);
             }
     
         case PB_HTYPE_REPEATED:
             if (wire_type == PB_WT_STRING
-                && PB_LTYPE(type) <= PB_LTYPE_LAST_PACKABLE)
+                && PB_LTYPE(field->type) <= PB_LTYPE_LAST_PACKABLE)
             {
                 /* Packed array, multiple items come in at once. */
                 bool status = true;
-                pb_size_t *size = (pb_size_t*)iter->pSize;
+                pb_size_t *size = (pb_size_t*)field->pSize;
                 size_t allocated_size = *size;
-                void *pItem;
                 pb_istream_t substream;
                 
                 if (!pb_make_string_substream(stream, &substream))
@@ -510,9 +603,9 @@ static bool checkreturn decode_pointer_field(pb_istream_t *stream, pb_wire_type_
                         /* Allocate more storage. This tries to guess the
                          * number of remaining entries. Round the division
                          * upwards. */
-                        allocated_size += (substream.bytes_left - 1) / iter->pos->data_size + 1;
+                        allocated_size += (substream.bytes_left - 1) / field->data_size + 1;
                         
-                        if (!allocate_field(&substream, iter->pData, iter->pos->data_size, allocated_size))
+                        if (!allocate_field(&substream, field->pField, field->data_size, allocated_size))
                         {
                             status = false;
                             break;
@@ -520,9 +613,9 @@ static bool checkreturn decode_pointer_field(pb_istream_t *stream, pb_wire_type_
                     }
 
                     /* Decode the array entry */
-                    pItem = *(uint8_t**)iter->pData + iter->pos->data_size * (*size);
-                    initialize_pointer_field(pItem, iter);
-                    if (!func(&substream, iter->pos, pItem))
+                    field->pData = *(char**)field->pField + field->data_size * (*size);
+                    initialize_pointer_field(field->pData, field);
+                    if (!decode_basic_field(&substream, field))
                     {
                         status = false;
                         break;
@@ -539,61 +632,57 @@ static bool checkreturn decode_pointer_field(pb_istream_t *stream, pb_wire_type_
                     
                     (*size)++;
                 }
-                pb_close_string_substream(stream, &substream);
+                if (!pb_close_string_substream(stream, &substream))
+                    return false;
                 
                 return status;
             }
             else
             {
                 /* Normal repeated field, i.e. only one item at a time. */
-                pb_size_t *size = (pb_size_t*)iter->pSize;
-                void *pItem;
-                
+                pb_size_t *size = (pb_size_t*)field->pSize;
+
                 if (*size == PB_SIZE_MAX)
                     PB_RETURN_ERROR(stream, "too many array entries");
                 
                 (*size)++;
-                if (!allocate_field(stream, iter->pData, iter->pos->data_size, *size))
+                if (!allocate_field(stream, field->pField, field->data_size, *size))
                     return false;
             
-                pItem = *(uint8_t**)iter->pData + iter->pos->data_size * (*size - 1);
-                initialize_pointer_field(pItem, iter);
-                return func(stream, iter->pos, pItem);
+                field->pData = *(char**)field->pField + field->data_size * (*size - 1);
+                initialize_pointer_field(field->pData, field);
+                return decode_basic_field(stream, field);
             }
-            
+
         default:
             PB_RETURN_ERROR(stream, "invalid field type");
     }
 #endif
 }
 
-static bool checkreturn decode_callback_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter)
+static bool checkreturn decode_callback_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field)
 {
-    pb_callback_t *pCallback = (pb_callback_t*)iter->pData;
-    
-#ifdef PB_OLD_CALLBACK_STYLE
-    void *arg = pCallback->arg;
-#else
-    void **arg = &(pCallback->arg);
-#endif
-    
-    if (pCallback->funcs.decode == NULL)
+    if (!field->descriptor->field_callback)
         return pb_skip_field(stream, wire_type);
-    
+
     if (wire_type == PB_WT_STRING)
     {
         pb_istream_t substream;
+        size_t prev_bytes_left;
         
         if (!pb_make_string_substream(stream, &substream))
             return false;
         
         do
         {
-            if (!pCallback->funcs.decode(&substream, iter->pos, arg))
+            prev_bytes_left = substream.bytes_left;
+            if (!field->descriptor->field_callback(&substream, NULL, field))
                 PB_RETURN_ERROR(stream, "callback failed");
-        } while (substream.bytes_left);
+        } while (substream.bytes_left > 0 && substream.bytes_left < prev_bytes_left);
         
-        pb_close_string_substream(stream, &substream);
+        if (!pb_close_string_substream(stream, &substream))
+            return false;
+
         return true;
     }
     else
@@ -603,53 +692,60 @@ static bool checkreturn decode_callback_field(pb_istream_t *stream, pb_wire_type
          * which in turn allows to use same callback for packed and
          * not-packed fields. */
         pb_istream_t substream;
-        uint8_t buffer[10];
+        pb_byte_t buffer[10];
         size_t size = sizeof(buffer);
         
         if (!read_raw_value(stream, wire_type, buffer, &size))
             return false;
         substream = pb_istream_from_buffer(buffer, size);
         
-        return pCallback->funcs.decode(&substream, iter->pos, arg);
+        return field->descriptor->field_callback(&substream, NULL, field);
     }
 }
 
-static bool checkreturn decode_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *iter)
+static bool checkreturn decode_field(pb_istream_t *stream, pb_wire_type_t wire_type, pb_field_iter_t *field)
 {
-    switch (PB_ATYPE(iter->pos->type))
+#ifdef PB_ENABLE_MALLOC
+    /* When decoding an oneof field, check if there is old data that must be
+     * released first. */
+    if (PB_HTYPE(field->type) == PB_HTYPE_ONEOF)
+    {
+        if (!pb_release_union_field(stream, field))
+            return false;
+    }
+#endif
+
+    switch (PB_ATYPE(field->type))
     {
         case PB_ATYPE_STATIC:
-            return decode_static_field(stream, wire_type, iter);
+            return decode_static_field(stream, wire_type, field);
         
         case PB_ATYPE_POINTER:
-            return decode_pointer_field(stream, wire_type, iter);
+            return decode_pointer_field(stream, wire_type, field);
         
         case PB_ATYPE_CALLBACK:
-            return decode_callback_field(stream, wire_type, iter);
+            return decode_callback_field(stream, wire_type, field);
         
         default:
             PB_RETURN_ERROR(stream, "invalid field type");
     }
 }
 
-/* Default handler for extension fields. Expects a pb_field_t structure
- * in extension->type->arg. */
+/* Default handler for extension fields. Expects to have a pb_msgdesc_t
+ * pointer in the extension->type->arg field, pointing to a message with
+ * only one field in it.  */
 static bool checkreturn default_extension_decoder(pb_istream_t *stream,
     pb_extension_t *extension, uint32_t tag, pb_wire_type_t wire_type)
 {
-    const pb_field_t *field = (const pb_field_t*)extension->type->arg;
     pb_field_iter_t iter;
-    
-    if (field->tag != tag)
+
+    if (!pb_field_iter_begin_extension(&iter, extension))
+        PB_RETURN_ERROR(stream, "invalid extension");
+
+    if (iter.tag != tag)
         return true;
-    
-    /* Fake a field iterator for the extension field.
-     * It is not actually safe to advance this iterator, but decode_field
-     * will not even try to. */
-    (void)pb_field_iter_begin(&iter, field, extension->dest);
-    iter.pData = extension->dest;
-    iter.pSize = &extension->found;
-    
+
+    extension->found = true;
     return decode_field(stream, wire_type, &iter);
 }
 
@@ -683,99 +779,160 @@ static bool checkreturn decode_extension(pb_istream_t *stream,
  * message. Returns false if no extension field is found. */
 static bool checkreturn find_extension_field(pb_field_iter_t *iter)
 {
-    const pb_field_t *start = iter->pos;
-    
+    pb_size_t start = iter->index;
+
     do {
-        if (PB_LTYPE(iter->pos->type) == PB_LTYPE_EXTENSION)
+        if (PB_LTYPE(iter->type) == PB_LTYPE_EXTENSION)
             return true;
         (void)pb_field_iter_next(iter);
-    } while (iter->pos != start);
+    } while (iter->index != start);
     
     return false;
 }
 
 /* Initialize message fields to default values, recursively */
-static void pb_message_set_to_defaults(const pb_field_t fields[], void *dest_struct)
+static bool pb_field_set_to_default(pb_field_iter_t *field)
 {
-    pb_field_iter_t iter;
+    pb_type_t type;
+    type = field->type;
 
-    if (!pb_field_iter_begin(&iter, fields, dest_struct))
-        return; /* Empty message type */
-    
-    do
+    if (PB_LTYPE(type) == PB_LTYPE_EXTENSION)
     {
-        pb_type_t type;
-        type = iter.pos->type;
-        
-        if (PB_ATYPE(type) == PB_ATYPE_STATIC)
+        pb_extension_t *ext = *(pb_extension_t* const *)field->pData;
+        while (ext != NULL)
         {
-            if (PB_HTYPE(type) == PB_HTYPE_OPTIONAL)
+            pb_field_iter_t ext_iter;
+            if (pb_field_iter_begin_extension(&ext_iter, ext))
             {
-                /* Set has_field to false. Still initialize the optional field
-                 * itself also. */
-                *(bool*)iter.pSize = false;
+                ext->found = false;
+                if (!pb_message_set_to_defaults(&ext_iter))
+                    return false;
             }
-            else if (PB_HTYPE(type) == PB_HTYPE_REPEATED)
-            {
-                /* Set array count to 0, no need to initialize contents. */
-                *(pb_size_t*)iter.pSize = 0;
-                continue;
-            }
-            
-            if (PB_LTYPE(iter.pos->type) == PB_LTYPE_SUBMESSAGE)
+            ext = ext->next;
+        }
+    }
+    else if (PB_ATYPE(type) == PB_ATYPE_STATIC)
+    {
+        bool init_data = true;
+        if (PB_HTYPE(type) == PB_HTYPE_OPTIONAL && field->pSize != NULL)
+        {
+            /* Set has_field to false. Still initialize the optional field
+             * itself also. */
+            *(bool*)field->pSize = false;
+        }
+        else if (PB_HTYPE(type) == PB_HTYPE_REPEATED ||
+                 PB_HTYPE(type) == PB_HTYPE_ONEOF)
+        {
+            /* REPEATED: Set array count to 0, no need to initialize contents.
+               ONEOF: Set which_field to 0. */
+            *(pb_size_t*)field->pSize = 0;
+            init_data = false;
+        }
+
+        if (init_data)
+        {
+            if (PB_LTYPE(field->type) == PB_LTYPE_SUBMESSAGE)
             {
                 /* Initialize submessage to defaults */
-                pb_message_set_to_defaults((const pb_field_t *) iter.pos->ptr, iter.pData);
-            }
-            else if (iter.pos->ptr != NULL)
-            {
-                /* Initialize to default value */
-                memcpy(iter.pData, iter.pos->ptr, iter.pos->data_size);
+                pb_field_iter_t submsg_iter;
+                if (pb_field_iter_begin(&submsg_iter, field->submsg_desc, field->pData))
+                {
+                    if (!pb_message_set_to_defaults(&submsg_iter))
+                        return false;
+                }
             }
             else
             {
                 /* Initialize to zeros */
-                memset(iter.pData, 0, iter.pos->data_size);
+                memset(field->pData, 0, field->data_size);
             }
         }
-        else if (PB_ATYPE(type) == PB_ATYPE_POINTER)
+    }
+    else if (PB_ATYPE(type) == PB_ATYPE_POINTER)
+    {
+        /* Initialize the pointer to NULL. */
+        *(void**)field->pField = NULL;
+
+        /* Initialize array count to 0. */
+        if (PB_HTYPE(type) == PB_HTYPE_REPEATED ||
+            PB_HTYPE(type) == PB_HTYPE_ONEOF)
         {
-            /* Initialize the pointer to NULL. */
-            *(void**)iter.pData = NULL;
-            
-            /* Initialize array count to 0. */
-            if (PB_HTYPE(type) == PB_HTYPE_REPEATED)
-            {
-                *(pb_size_t*)iter.pSize = 0;
-            }
+            *(pb_size_t*)field->pSize = 0;
         }
-        else if (PB_ATYPE(type) == PB_ATYPE_CALLBACK)
+    }
+    else if (PB_ATYPE(type) == PB_ATYPE_CALLBACK)
+    {
+        /* Don't overwrite callback */
+    }
+
+    return true;
+}
+
+static bool pb_message_set_to_defaults(pb_field_iter_t *iter)
+{
+    pb_istream_t defstream = PB_ISTREAM_EMPTY;
+    uint32_t tag = 0;
+    pb_wire_type_t wire_type = PB_WT_VARINT;
+    bool eof;
+
+    if (iter->descriptor->default_value)
+    {
+        defstream = pb_istream_from_buffer(iter->descriptor->default_value, (size_t)-1);
+        if (!pb_decode_tag(&defstream, &wire_type, &tag, &eof))
+            return false;
+    }
+
+    do
+    {
+        if (!pb_field_set_to_default(iter))
+            return false;
+
+        if (tag != 0 && iter->tag == tag)
         {
-            /* Don't overwrite callback */
+            /* We have a default value for this field in the defstream */
+            if (!decode_field(&defstream, wire_type, iter))
+                return false;
+            if (!pb_decode_tag(&defstream, &wire_type, &tag, &eof))
+                return false;
+
+            if (iter->pSize)
+                *(bool*)iter->pSize = false;
         }
-    } while (pb_field_iter_next(&iter));
+    } while (pb_field_iter_next(iter));
+
+    return true;
 }
 
 /*********************
  * Decode all fields *
  *********************/
 
-bool checkreturn pb_decode_noinit(pb_istream_t *stream, const pb_field_t fields[], void *dest_struct)
+static bool checkreturn pb_decode_inner(pb_istream_t *stream, const pb_msgdesc_t *fields, void *dest_struct, unsigned int flags)
 {
-    uint8_t fields_seen[(PB_MAX_REQUIRED_FIELDS + 7) / 8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t extension_range_start = 0;
+
+    /* 'fixed_count_field' and 'fixed_count_size' track position of a repeated fixed
+     * count field. This can only handle _one_ repeated fixed count field that
+     * is unpacked and unordered among other (non repeated fixed count) fields.
+     */
+    pb_size_t fixed_count_field = PB_SIZE_MAX;
+    pb_size_t fixed_count_size = 0;
+    pb_size_t fixed_count_total_size = 0;
+
+    pb_fields_seen_t fields_seen = {{0, 0}};
+    const uint32_t allbits = ~(uint32_t)0;
     pb_field_iter_t iter;
-    
+
     /* Return value ignored, as empty message types will be correctly handled by
      * pb_field_iter_find() anyway. */
     (void)pb_field_iter_begin(&iter, fields, dest_struct);
-    
+
     while (stream->bytes_left)
     {
         uint32_t tag;
         pb_wire_type_t wire_type;
         bool eof;
-        
+
         if (!pb_decode_tag(stream, &wire_type, &tag, &eof))
         {
             if (eof)
@@ -783,8 +940,20 @@ bool checkreturn pb_decode_noinit(pb_istream_t *stream, const pb_field_t fields[
             else
                 return false;
         }
-        
-        if (!pb_field_iter_find(&iter, tag))
+
+        if (tag == 0)
+        {
+          if (flags & PB_DECODE_NULLTERMINATED)
+          {
+            break;
+          }
+          else
+          {
+            PB_RETURN_ERROR(stream, "zero tag");
+          }
+        }
+
+        if (!pb_field_iter_find(&iter, tag) || PB_LTYPE(iter.type) == PB_LTYPE_EXTENSION)
         {
             /* No match found, check if it matches an extension. */
             if (tag >= extension_range_start)
@@ -792,39 +961,71 @@ bool checkreturn pb_decode_noinit(pb_istream_t *stream, const pb_field_t fields[
                 if (!find_extension_field(&iter))
                     extension_range_start = (uint32_t)-1;
                 else
-                    extension_range_start = iter.pos->tag;
-                
+                    extension_range_start = iter.tag;
+
                 if (tag >= extension_range_start)
                 {
                     size_t pos = stream->bytes_left;
-                
+
                     if (!decode_extension(stream, tag, wire_type, &iter))
                         return false;
-                    
+
                     if (pos != stream->bytes_left)
                     {
                         /* The field was handled */
-                        continue;                    
+                        continue;
                     }
                 }
             }
-        
+
             /* No match found, skip data */
             if (!pb_skip_field(stream, wire_type))
                 return false;
             continue;
         }
-        
-        if (PB_HTYPE(iter.pos->type) == PB_HTYPE_REQUIRED
+
+        /* If a repeated fixed count field was found, get size from
+         * 'fixed_count_field' as there is no counter contained in the struct.
+         */
+        if (PB_HTYPE(iter.type) == PB_HTYPE_REPEATED && iter.pSize == &iter.array_size)
+        {
+            if (fixed_count_field != iter.index) {
+                /* If the new fixed count field does not match the previous one,
+                 * check that the previous one is NULL or that it finished
+                 * receiving all the expected data.
+                 */
+                if (fixed_count_field != PB_SIZE_MAX &&
+                    fixed_count_size != fixed_count_total_size)
+                {
+                    PB_RETURN_ERROR(stream, "wrong size for fixed count field");
+                }
+
+                fixed_count_field = iter.index;
+                fixed_count_size = 0;
+                fixed_count_total_size = iter.array_size;
+            }
+
+            iter.pSize = &fixed_count_size;
+        }
+
+        if (PB_HTYPE(iter.type) == PB_HTYPE_REQUIRED
             && iter.required_field_index < PB_MAX_REQUIRED_FIELDS)
         {
-            fields_seen[iter.required_field_index >> 3] |= (uint8_t)(1 << (iter.required_field_index & 7));
+            uint32_t tmp = ((uint32_t)1 << (iter.required_field_index & 31));
+            fields_seen.bitfield[iter.required_field_index >> 5] |= tmp;
         }
-            
+
         if (!decode_field(stream, wire_type, &iter))
             return false;
     }
-    
+
+    /* Check that all elements of the last decoded fixed count field were present. */
+    if (fixed_count_field != PB_SIZE_MAX &&
+        fixed_count_size != fixed_count_total_size)
+    {
+        PB_RETURN_ERROR(stream, "wrong size for fixed count field");
+    }
+
     /* Check that all required fields were present. */
     {
         /* First figure out the number of required fields by
@@ -836,33 +1037,70 @@ bool checkreturn pb_decode_noinit(pb_istream_t *stream, const pb_field_t fields[
         unsigned i;
         do {
             req_field_count = iter.required_field_index;
-            last_type = iter.pos->type;
+            last_type = iter.type;
         } while (pb_field_iter_next(&iter));
-        
+
         /* Fixup if last field was also required. */
-        if (PB_HTYPE(last_type) == PB_HTYPE_REQUIRED && iter.pos->tag != 0)
+        if (PB_HTYPE(last_type) == PB_HTYPE_REQUIRED && iter.tag != 0)
             req_field_count++;
-        
-        /* Check the whole bytes */
-        for (i = 0; i < (req_field_count >> 3); i++)
+
+        if (req_field_count > PB_MAX_REQUIRED_FIELDS)
+            req_field_count = PB_MAX_REQUIRED_FIELDS;
+
+        if (req_field_count > 0)
         {
-            if (fields_seen[i] != 0xFF)
-                PB_RETURN_ERROR(stream, "missing required field");
+            /* Check the whole words */
+            for (i = 0; i < (req_field_count >> 5); i++)
+            {
+                if (fields_seen.bitfield[i] != allbits)
+                    PB_RETURN_ERROR(stream, "missing required field");
+            }
+
+            /* Check the remaining bits (if any) */
+            if ((req_field_count & 31) != 0)
+            {
+                if (fields_seen.bitfield[req_field_count >> 5] !=
+                    (allbits >> (32 - (req_field_count & 31))))
+                {
+                    PB_RETURN_ERROR(stream, "missing required field");
+                }
+            }
         }
-        
-        /* Check the remaining bits */
-        if (fields_seen[req_field_count >> 3] != (0xFF >> (8 - (req_field_count & 7))))
-            PB_RETURN_ERROR(stream, "missing required field");
     }
-    
+
     return true;
 }
 
-bool checkreturn pb_decode(pb_istream_t *stream, const pb_field_t fields[], void *dest_struct)
+bool checkreturn pb_decode_ex(pb_istream_t *stream, const pb_msgdesc_t *fields, void *dest_struct, unsigned int flags)
 {
     bool status;
-    pb_message_set_to_defaults(fields, dest_struct);
-    status = pb_decode_noinit(stream, fields, dest_struct);
+
+    if ((flags & PB_DECODE_NOINIT) == 0)
+    {
+        pb_field_iter_t iter;
+
+        if (pb_field_iter_begin(&iter, fields, dest_struct))
+        {
+            if (!pb_message_set_to_defaults(&iter))
+                PB_RETURN_ERROR(stream, "failed to set defaults");
+        }
+    }
+
+    if ((flags & PB_DECODE_DELIMITED) == 0)
+    {
+      status = pb_decode_inner(stream, fields, dest_struct, flags);
+    }
+    else
+    {
+      pb_istream_t substream;
+      if (!pb_make_string_substream(stream, &substream))
+        return false;
+
+      status = pb_decode_inner(&substream, fields, dest_struct, flags);
+
+      if (!pb_close_string_substream(stream, &substream))
+        return false;
+    }
     
 #ifdef PB_ENABLE_MALLOC
     if (!status)
@@ -872,25 +1110,99 @@ bool checkreturn pb_decode(pb_istream_t *stream, const pb_field_t fields[], void
     return status;
 }
 
-bool pb_decode_delimited(pb_istream_t *stream, const pb_field_t fields[], void *dest_struct)
+bool checkreturn pb_decode(pb_istream_t *stream, const pb_msgdesc_t *fields, void *dest_struct)
 {
-    pb_istream_t substream;
-    bool status;
-    
-    if (!pb_make_string_substream(stream, &substream))
-        return false;
-    
-    status = pb_decode(&substream, fields, dest_struct);
-    pb_close_string_substream(stream, &substream);
-    return status;
+  return pb_decode_ex(stream, fields, dest_struct, 0);
 }
 
 #ifdef PB_ENABLE_MALLOC
-static void pb_release_single_field(const pb_field_iter_t *iter)
+/* Given an oneof field, if there has already been a field inside this oneof,
+ * release it before overwriting with a different one. */
+static bool pb_release_union_field(pb_istream_t *stream, pb_field_iter_t *field)
+{
+    pb_field_iter_t old_field = *field;
+    pb_size_t old_tag = *(pb_size_t*)field->pSize; /* Previous which_ value */
+    pb_size_t new_tag = field->tag; /* New which_ value */
+
+    if (old_tag == 0)
+        return true; /* Ok, no old data in union */
+
+    if (old_tag == new_tag)
+        return true; /* Ok, old data is of same type => merge */
+
+    /* Release old data. The find can fail if the message struct contains
+     * invalid data. */
+    if (!pb_field_iter_find(&old_field, old_tag))
+        PB_RETURN_ERROR(stream, "invalid union tag");
+
+    pb_release_single_field(&old_field);
+
+    return true;
+}
+
+static void pb_release_single_field(pb_field_iter_t *field)
 {
     pb_type_t type;
-    type = iter->pos->type;
+    type = field->type;
 
+    if (PB_HTYPE(type) == PB_HTYPE_ONEOF)
+    {
+        if (*(pb_size_t*)field->pSize != field->tag)
+            return; /* This is not the current field in the union */
+    }
+
+    /* Release anything contained inside an extension or submsg.
+     * This has to be done even if the submsg itself is statically
+     * allocated. */
+    if (PB_LTYPE(type) == PB_LTYPE_EXTENSION)
+    {
+        /* Release fields from all extensions in the linked list */
+        pb_extension_t *ext = *(pb_extension_t**)field->pData;
+        while (ext != NULL)
+        {
+            pb_field_iter_t ext_iter;
+            if (pb_field_iter_begin_extension(&ext_iter, ext))
+            {
+                pb_release_single_field(&ext_iter);
+            }
+            ext = ext->next;
+        }
+    }
+    else if (PB_LTYPE(type) == PB_LTYPE_SUBMESSAGE && PB_ATYPE(type) != PB_ATYPE_CALLBACK)
+    {
+        /* Release fields in submessage or submsg array */
+        pb_size_t count = 1;
+        
+        if (PB_ATYPE(type) == PB_ATYPE_POINTER)
+        {
+            field->pData = *(void**)field->pField;
+        }
+        else
+        {
+            field->pData = field->pField;
+        }
+        
+        if (PB_HTYPE(type) == PB_HTYPE_REPEATED)
+        {
+            count = *(pb_size_t*)field->pSize;
+
+            if (PB_ATYPE(type) == PB_ATYPE_STATIC && count > field->array_size)
+            {
+                /* Protect against corrupted _count fields */
+                count = field->array_size;
+            }
+        }
+        
+        if (field->pData)
+        {
+            while (count--)
+            {
+                pb_release(field->submsg_desc, field->pData);
+                field->pData = (char*)field->pData + field->data_size;
+            }
+        }
+    }
+    
     if (PB_ATYPE(type) == PB_ATYPE_POINTER)
     {
         if (PB_HTYPE(type) == PB_HTYPE_REPEATED &&
@@ -898,47 +1210,34 @@ static void pb_release_single_field(const pb_field_iter_t *iter)
              PB_LTYPE(type) == PB_LTYPE_BYTES))
         {
             /* Release entries in repeated string or bytes array */
-            void **pItem = *(void***)iter->pData;
-            pb_size_t count = *(pb_size_t*)iter->pSize;
+            void **pItem = *(void***)field->pField;
+            pb_size_t count = *(pb_size_t*)field->pSize;
             while (count--)
             {
                 pb_free(*pItem);
                 *pItem++ = NULL;
             }
-            *(pb_size_t*)iter->pSize = 0;
-        }
-        else if (PB_LTYPE(type) == PB_LTYPE_SUBMESSAGE)
-        {
-            /* Release fields in submessages */
-            void *pItem = *(void**)iter->pData;
-            if (pItem)
-            {
-                pb_size_t count = 1;
-                
-                if (PB_HTYPE(type) == PB_HTYPE_REPEATED)
-                {
-                    count = *(pb_size_t*)iter->pSize;
-                    *(pb_size_t*)iter->pSize = 0;
-                }
-                
-                while (count--)
-                {
-                    pb_release((const pb_field_t*)iter->pos->ptr, pItem);
-                    pItem = (uint8_t*)pItem + iter->pos->data_size;
-                }
-            }
         }
         
-        /* Release main item */
-        pb_free(*(void**)iter->pData);
-        *(void**)iter->pData = NULL;
+        if (PB_HTYPE(type) == PB_HTYPE_REPEATED)
+        {
+            /* We are going to release the array, so set the size to 0 */
+            *(pb_size_t*)field->pSize = 0;
+        }
+        
+        /* Release main pointer */
+        pb_free(*(void**)field->pField);
+        *(void**)field->pField = NULL;
     }
 }
 
-void pb_release(const pb_field_t fields[], void *dest_struct)
+void pb_release(const pb_msgdesc_t *fields, void *dest_struct)
 {
     pb_field_iter_t iter;
     
+    if (!dest_struct)
+        return; /* Ignore NULL pointers, similar to free() */
+
     if (!pb_field_iter_begin(&iter, fields, dest_struct))
         return; /* Empty message type */
     
@@ -951,129 +1250,165 @@ void pb_release(const pb_field_t fields[], void *dest_struct)
 
 /* Field decoders */
 
-bool pb_decode_svarint(pb_istream_t *stream, int64_t *dest)
+bool pb_decode_svarint(pb_istream_t *stream, pb_int64_t *dest)
 {
-    uint64_t value;
+    pb_uint64_t value;
     if (!pb_decode_varint(stream, &value))
         return false;
     
     if (value & 1)
-        *dest = (int64_t)(~(value >> 1));
+        *dest = (pb_int64_t)(~(value >> 1));
     else
-        *dest = (int64_t)(value >> 1);
+        *dest = (pb_int64_t)(value >> 1);
     
     return true;
 }
 
 bool pb_decode_fixed32(pb_istream_t *stream, void *dest)
 {
-    #ifdef __BIG_ENDIAN__
-    uint8_t *bytes = (uint8_t*)dest;
-    uint8_t lebytes[4];
-    
-    if (!pb_read(stream, lebytes, 4))
+    union {
+        uint32_t fixed32;
+        pb_byte_t bytes[4];
+    } u;
+
+    if (!pb_read(stream, u.bytes, 4))
         return false;
-    
-    bytes[0] = lebytes[3];
-    bytes[1] = lebytes[2];
-    bytes[2] = lebytes[1];
-    bytes[3] = lebytes[0];
+
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN && CHAR_BIT == 8
+    /* fast path - if we know that we're on little endian, assign directly */
+    *(uint32_t*)dest = u.fixed32;
+#else
+    *(uint32_t*)dest = ((uint32_t)u.bytes[0] << 0) |
+                       ((uint32_t)u.bytes[1] << 8) |
+                       ((uint32_t)u.bytes[2] << 16) |
+                       ((uint32_t)u.bytes[3] << 24);
+#endif
     return true;
-    #else
-    return pb_read(stream, (uint8_t*)dest, 4);
-    #endif   
 }
 
+#ifndef PB_WITHOUT_64BIT
 bool pb_decode_fixed64(pb_istream_t *stream, void *dest)
 {
-    #ifdef __BIG_ENDIAN__
-    uint8_t *bytes = (uint8_t*)dest;
-    uint8_t lebytes[8];
-    
-    if (!pb_read(stream, lebytes, 8))
-        return false;
-    
-    bytes[0] = lebytes[7];
-    bytes[1] = lebytes[6];
-    bytes[2] = lebytes[5];
-    bytes[3] = lebytes[4];
-    bytes[4] = lebytes[3];
-    bytes[5] = lebytes[2];
-    bytes[6] = lebytes[1];
-    bytes[7] = lebytes[0];
-    return true;
-    #else
-    return pb_read(stream, (uint8_t*)dest, 8);
-    #endif   
-}
+    union {
+        uint64_t fixed64;
+        pb_byte_t bytes[8];
+    } u;
 
-static bool checkreturn pb_dec_varint(pb_istream_t *stream, const pb_field_t *field, void *dest)
-{
-    uint64_t value;
-    if (!pb_decode_varint(stream, &value))
+    if (!pb_read(stream, u.bytes, 8))
         return false;
-    
-    switch (field->data_size)
+
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN && CHAR_BIT == 8
+    /* fast path - if we know that we're on little endian, assign directly */
+    *(uint64_t*)dest = u.fixed64;
+#else
+    *(uint64_t*)dest = ((uint64_t)u.bytes[0] << 0) |
+                       ((uint64_t)u.bytes[1] << 8) |
+                       ((uint64_t)u.bytes[2] << 16) |
+                       ((uint64_t)u.bytes[3] << 24) |
+                       ((uint64_t)u.bytes[4] << 32) |
+                       ((uint64_t)u.bytes[5] << 40) |
+                       ((uint64_t)u.bytes[6] << 48) |
+                       ((uint64_t)u.bytes[7] << 56);
+#endif
+    return true;
+}
+#endif
+
+static bool checkreturn pb_dec_varint(pb_istream_t *stream, const pb_field_iter_t *field)
+{
+    if (PB_LTYPE(field->type) == PB_LTYPE_UVARINT)
     {
-        case 1: *(int8_t*)dest = (int8_t)value; break;
-        case 2: *(int16_t*)dest = (int16_t)value; break;
-        case 4: *(int32_t*)dest = (int32_t)value; break;
-        case 8: *(int64_t*)dest = (int64_t)value; break;
-        default: PB_RETURN_ERROR(stream, "invalid data_size");
-    }
-    
-    return true;
-}
+        pb_uint64_t value, clamped;
+        if (!pb_decode_varint(stream, &value))
+            return false;
 
-static bool checkreturn pb_dec_uvarint(pb_istream_t *stream, const pb_field_t *field, void *dest)
-{
-    uint64_t value;
-    if (!pb_decode_varint(stream, &value))
-        return false;
-    
-    switch (field->data_size)
+        /* Cast to the proper field size, while checking for overflows */
+        if (field->data_size == sizeof(pb_uint64_t))
+            clamped = *(pb_uint64_t*)field->pData = value;
+        else if (field->data_size == sizeof(uint32_t))
+            clamped = *(uint32_t*)field->pData = (uint32_t)value;
+        else if (field->data_size == sizeof(uint_least16_t))
+            clamped = *(uint_least16_t*)field->pData = (uint_least16_t)value;
+        else if (field->data_size == sizeof(uint_least8_t))
+            clamped = *(uint_least8_t*)field->pData = (uint_least8_t)value;
+        else
+            PB_RETURN_ERROR(stream, "invalid data_size");
+
+        if (clamped != value)
+            PB_RETURN_ERROR(stream, "integer too large");
+
+        return true;
+    }
+    else
     {
-        case 4: *(uint32_t*)dest = (uint32_t)value; break;
-        case 8: *(uint64_t*)dest = value; break;
-        default: PB_RETURN_ERROR(stream, "invalid data_size");
+        pb_uint64_t value;
+        pb_int64_t svalue;
+        pb_int64_t clamped;
+
+        if (PB_LTYPE(field->type) == PB_LTYPE_SVARINT)
+        {
+            if (!pb_decode_svarint(stream, &svalue))
+                return false;
+        }
+        else
+        {
+            if (!pb_decode_varint(stream, &value))
+                return false;
+
+            /* See issue 97: Google's C++ protobuf allows negative varint values to
+            * be cast as int32_t, instead of the int64_t that should be used when
+            * encoding. Previous nanopb versions had a bug in encoding. In order to
+            * not break decoding of such messages, we cast <=32 bit fields to
+            * int32_t first to get the sign correct.
+            */
+            if (field->data_size == sizeof(pb_int64_t))
+                svalue = (pb_int64_t)value;
+            else
+                svalue = (int32_t)value;
+        }
+
+        /* Cast to the proper field size, while checking for overflows */
+        if (field->data_size == sizeof(pb_int64_t))
+            clamped = *(pb_int64_t*)field->pData = svalue;
+        else if (field->data_size == sizeof(int32_t))
+            clamped = *(int32_t*)field->pData = (int32_t)svalue;
+        else if (field->data_size == sizeof(int_least16_t))
+            clamped = *(int_least16_t*)field->pData = (int_least16_t)svalue;
+        else if (field->data_size == sizeof(int_least8_t))
+            clamped = *(int_least8_t*)field->pData = (int_least8_t)svalue;
+        else
+            PB_RETURN_ERROR(stream, "invalid data_size");
+
+        if (clamped != svalue)
+            PB_RETURN_ERROR(stream, "integer too large");
+
+        return true;
     }
-    
-    return true;
 }
 
-static bool checkreturn pb_dec_svarint(pb_istream_t *stream, const pb_field_t *field, void *dest)
+static bool checkreturn pb_dec_fixed(pb_istream_t *stream, const pb_field_iter_t *field)
 {
-    int64_t value;
-    if (!pb_decode_svarint(stream, &value))
-        return false;
-    
-    switch (field->data_size)
+    if (field->data_size == sizeof(uint32_t))
     {
-        case 4: *(int32_t*)dest = (int32_t)value; break;
-        case 8: *(int64_t*)dest = value; break;
-        default: PB_RETURN_ERROR(stream, "invalid data_size");
+        return pb_decode_fixed32(stream, field->pData);
     }
-    
-    return true;
+#ifndef PB_WITHOUT_64BIT
+    else if (field->data_size == sizeof(uint64_t))
+    {
+        return pb_decode_fixed64(stream, field->pData);
+    }
+#endif
+    else
+    {
+        PB_RETURN_ERROR(stream, "invalid data_size");
+    }
 }
 
-static bool checkreturn pb_dec_fixed32(pb_istream_t *stream, const pb_field_t *field, void *dest)
-{
-    PB_UNUSED(field);
-    return pb_decode_fixed32(stream, dest);
-}
-
-static bool checkreturn pb_dec_fixed64(pb_istream_t *stream, const pb_field_t *field, void *dest)
-{
-    PB_UNUSED(field);
-    return pb_decode_fixed64(stream, dest);
-}
-
-static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_t *field, void *dest)
+static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_iter_t *field)
 {
     uint32_t size;
     size_t alloc_size;
-    pb_bytes_array_t *bdest;
+    pb_bytes_array_t *dest;
     
     if (!pb_decode_varint32(stream, &size))
         return false;
@@ -1090,27 +1425,28 @@ static bool checkreturn pb_dec_bytes(pb_istream_t *stream, const pb_field_t *fie
 #ifndef PB_ENABLE_MALLOC
         PB_RETURN_ERROR(stream, "no malloc support");
 #else
-        if (!allocate_field(stream, dest, alloc_size, 1))
+        if (!allocate_field(stream, field->pData, alloc_size, 1))
             return false;
-        bdest = *(pb_bytes_array_t**)dest;
+        dest = *(pb_bytes_array_t**)field->pData;
 #endif
     }
     else
     {
         if (alloc_size > field->data_size)
             PB_RETURN_ERROR(stream, "bytes overflow");
-        bdest = (pb_bytes_array_t*)dest;
+        dest = (pb_bytes_array_t*)field->pData;
     }
 
-    bdest->size = (pb_size_t)size;
-    return pb_read(stream, bdest->bytes, size);
+    dest->size = (pb_size_t)size;
+    return pb_read(stream, dest->bytes, size);
 }
 
-static bool checkreturn pb_dec_string(pb_istream_t *stream, const pb_field_t *field, void *dest)
+static bool checkreturn pb_dec_string(pb_istream_t *stream, const pb_field_iter_t *field)
 {
     uint32_t size;
     size_t alloc_size;
-    bool status;
+    pb_byte_t *dest = (pb_byte_t*)field->pData;
+
     if (!pb_decode_varint32(stream, &size))
         return false;
     
@@ -1125,9 +1461,9 @@ static bool checkreturn pb_dec_string(pb_istream_t *stream, const pb_field_t *fi
 #ifndef PB_ENABLE_MALLOC
         PB_RETURN_ERROR(stream, "no malloc support");
 #else
-        if (!allocate_field(stream, dest, alloc_size, 1))
+        if (!allocate_field(stream, field->pData, alloc_size, 1))
             return false;
-        dest = *(void**)dest;
+        dest = *(pb_byte_t**)field->pData;
 #endif
     }
     else
@@ -1136,30 +1472,55 @@ static bool checkreturn pb_dec_string(pb_istream_t *stream, const pb_field_t *fi
             PB_RETURN_ERROR(stream, "string overflow");
     }
     
-    status = pb_read(stream, (uint8_t*)dest, size);
-    *((uint8_t*)dest + size) = 0;
-    return status;
+    dest[size] = 0;
+    return pb_read(stream, dest, size);
 }
 
-static bool checkreturn pb_dec_submessage(pb_istream_t *stream, const pb_field_t *field, void *dest)
+static bool checkreturn pb_dec_submessage(pb_istream_t *stream, const pb_field_iter_t *field)
 {
     bool status;
     pb_istream_t substream;
-    const pb_field_t* submsg_fields = (const pb_field_t*)field->ptr;
-    
+
     if (!pb_make_string_substream(stream, &substream))
         return false;
     
-    if (field->ptr == NULL)
+    if (field->submsg_desc == NULL)
         PB_RETURN_ERROR(stream, "invalid field descriptor");
     
     /* New array entries need to be initialized, while required and optional
      * submessages have already been initialized in the top-level pb_decode. */
-    if (PB_HTYPE(field->type) == PB_HTYPE_REPEATED)
-        status = pb_decode(&substream, submsg_fields, dest);
+    if (PB_HTYPE(field->type) == PB_HTYPE_REPEATED ||
+        PB_HTYPE(field->type) == PB_HTYPE_ONEOF)
+        status = pb_decode(&substream, field->submsg_desc, field->pData);
     else
-        status = pb_decode_noinit(&substream, submsg_fields, dest);
+        status = pb_decode_noinit(&substream, field->submsg_desc, field->pData);
     
-    pb_close_string_substream(stream, &substream);
+    if (!pb_close_string_substream(stream, &substream))
+        return false;
+
     return status;
 }
+
+static bool checkreturn pb_dec_fixed_length_bytes(pb_istream_t *stream, const pb_field_iter_t *field)
+{
+    uint32_t size;
+
+    if (!pb_decode_varint32(stream, &size))
+        return false;
+
+    if (size > PB_SIZE_MAX)
+        PB_RETURN_ERROR(stream, "bytes overflow");
+
+    if (size == 0)
+    {
+        /* As a special case, treat empty bytes string as all zeros for fixed_length_bytes. */
+        memset(field->pData, 0, field->data_size);
+        return true;
+    }
+
+    if (size != field->data_size)
+        PB_RETURN_ERROR(stream, "incorrect fixed length bytes size");
+
+    return pb_read(stream, (pb_byte_t*)field->pData, field->data_size);
+}
+
